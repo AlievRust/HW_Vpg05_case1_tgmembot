@@ -1,0 +1,44 @@
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+
+# Version control
+.git/
+.gitignore
+
+# Python environments and generated files
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Persistent runtime data (mounted by docker-compose)
+data/
+
+# IDE and OS files
+.vscode/
+.idea/
+.vs/
+.DS_Store
+Thumbs.db
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+
+# Files not used by the image build
+1st_prompt.txt
+README*
+docker-compose*.yml
+tests/
+*.ipynb
