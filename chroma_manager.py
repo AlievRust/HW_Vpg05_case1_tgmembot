@@ -607,10 +607,18 @@ class ChromaManager:
             kwargs["where"] = dict(where)
         if where_document is not None:
             kwargs["where_document"] = dict(where_document)
-        # Расстояние добавляется всегда, даже если вызывающий код попросил
+        # При обычном вызове search() нужны не только расстояния, но и сами
+        # документы: answer_with_memory() использует documents для построения
+        # контекста prompt. Ранее здесь из-за ``include or []`` запрашивались
+        # только distances, поэтому LLM получала пустой контекст памяти.
+        requested_include = (
+            ["documents", "metadatas", "distances"]
+            if include is None
+            else list(include)
+        )
+        # Расстояние добавляется всегда, даже если вызывающий код явно попросил
         # только документы. Так контракт search() гарантирует расстояние для
         # каждого найденного результата.
-        requested_include = list(include or [])
         if "distances" not in requested_include:
             requested_include.append("distances")
         if requested_include:
