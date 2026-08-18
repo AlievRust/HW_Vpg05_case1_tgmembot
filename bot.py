@@ -68,7 +68,7 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-def _model_from_env() -> tuple[str, str]:
+def _model_from_env() -> tuple[str, str, str]:
     """Собирает модели чата и embeddings с поддержкой текущих имён .env.
 
     В существующем учебном окружении уже используются ``YANDEX_CLOUD_MODEL``
@@ -87,7 +87,12 @@ def _model_from_env() -> tuple[str, str]:
     embedding_model = os.getenv("YANDEX_EMBEDDING_MODEL")
     if not embedding_model:
         embedding_model = f"emb://{folder_id}/text-search-doc/latest"
-    return chat_model, embedding_model
+    query_embedding_model = os.getenv("YANDEX_QUERY_EMBEDDING_MODEL")
+    if not query_embedding_model:
+        query_embedding_model = embedding_model.replace(
+            "text-search-doc", "text-search-query"
+        )
+    return chat_model, embedding_model, query_embedding_model
 
 
 @dataclass(frozen=True)
@@ -300,7 +305,7 @@ class MemoryService:
 def build_manager() -> ChromaManager:
     """Создаёт ChromaManager из переменных окружения проекта."""
 
-    chat_model, embedding_model = _model_from_env()
+    chat_model, embedding_model, query_embedding_model = _model_from_env()
     return ChromaManager(
         collection_name=os.getenv("CHROMA_COLLECTION", "assistant_memory"),
         persist_directory=os.getenv("CHROMA_PERSIST_DIRECTORY")
@@ -310,6 +315,7 @@ def build_manager() -> ChromaManager:
         or os.getenv("YANDEX_OPENAI_BASE_URL", ChromaManager.DEFAULT_BASE_URL),
         chat_model=chat_model,
         embedding_model=embedding_model,
+        query_embedding_model=query_embedding_model,
     )
 
 

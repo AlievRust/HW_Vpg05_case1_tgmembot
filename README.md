@@ -102,6 +102,7 @@ YANDEX_FOLDER_ID=your_folder_id
 YANDEX_OPENAI_BASE_URL=https://ai.api.cloud.yandex.net/v1
 YANDEXGPT_MODEL=gpt://your_folder_id/yandexgpt/latest
 YANDEX_EMBEDDING_MODEL=emb://your_folder_id/text-search-doc/latest
+YANDEX_QUERY_EMBEDDING_MODEL=emb://your_folder_id/text-search-query/latest
 ```
 
 ### Основные переменные
@@ -114,6 +115,7 @@ YANDEX_EMBEDDING_MODEL=emb://your_folder_id/text-search-doc/latest
 | `YANDEX_OPENAI_BASE_URL` | `https://ai.api.cloud.yandex.net/v1` | OpenAI-совместимый endpoint |
 | `YANDEXGPT_MODEL` | `gpt://<folder_id>/yandexgpt/latest` | Модель генерации и классификации |
 | `YANDEX_EMBEDDING_MODEL` | `emb://<folder_id>/text-search-doc/latest` | Модель embeddings |
+| `YANDEX_QUERY_EMBEDDING_MODEL` | `emb://<folder_id>/text-search-query/latest` | Модель embeddings для поисковых запросов |
 | `CHROMA_COLLECTION` | `assistant_memory` | Имя коллекции ChromaDB |
 | `CHROMA_PERSIST_DIRECTORY` | `data/chroma` | Каталог локального хранилища |
 | `MEMORY_CONTEXT_SIZE` | `5` | Количество записей в контексте ответа |
@@ -237,3 +239,26 @@ python -m py_compile chroma_manager.py bot.py
 docker compose config --quiet
 ```
 
+## Диагностика embeddings
+
+Если в логах появляется:
+
+```text
+POST https://ai.api.cloud.yandex.net/v1/embeddings 400 Bad Request
+Failed to parse request JSON
+```
+
+убедитесь, что контейнер пересобран после обновления `chroma_manager.py`:
+
+```bash
+docker compose down
+docker compose build --no-cache
+docker compose up
+```
+
+Текущая реализация отправляет исходный текст напрямую в embeddings API как строковый `input`, а не как массив token IDs. В `.env` желательно явно указать обе модели:
+
+```env
+YANDEX_EMBEDDING_MODEL=emb://your_folder_id/text-search-doc/latest
+YANDEX_QUERY_EMBEDDING_MODEL=emb://your_folder_id/text-search-query/latest
+```

@@ -9,10 +9,11 @@
 * полностью очистить коллекцию;
 * передать найденный контекст в YandexGPT через OpenAI-совместимый API.
 
-Для работы с Yandex AI Studio используются стандартные классы LangChain:
-``OpenAIEmbeddings`` и ``ChatOpenAI``. Поэтому тот же модуль можно использовать
-с другим OpenAI-совместимым провайдером, заменив значения ``base_url``, ключа и
-названий моделей.
+Для генерации ответов используется ``ChatOpenAI``, а для embeddings —
+OpenAI-совместимый клиент с прямой передачей текста в Yandex AI Studio. Прямая
+передача нужна потому, что endpoint Yandex ожидает текстовый ``input`` и не
+принимает массивы токенов, которые некоторые версии LangChain формируют
+автоматически.
 
 Минимальная настройка через файл ``.env``::
 
@@ -39,6 +40,7 @@ from uuid import uuid4
 import chromadb
 from chromadb.api.models.Collection import Collection
 from dotenv import load_dotenv
+from openai import OpenAI
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
 
@@ -89,6 +91,72 @@ class _LangChainEmbeddingAdapter:
 
         texts = [input] if isinstance(input, str) else list(input)
         return [list(self._embeddings.embed_query(text)) for text in texts]
+
+
+class _YandexOpenAIEmbeddingAdapter:
+    """Получает embeddings напрямую через OpenAI-совместимый Yandex API.
+
+    ``OpenAIEmbeddings`` LangChain по умолчанию токенизирует текст локально и
+    может отправить в endpoint массив числовых token IDs. OpenAI API это обычно
+    допускает, но Yandex AI Studio в этом режиме ожидает строковый ``input``.
+    Поэтому здесь каждый исходный текст отправляется напрямую как строка.
+
+    Для документов и поисковых запросов используются разные модели Yandex:
+    ``text-search-doc`` и ``text-search-query``. Это соответствует назначению
+    моделей: одна предназначена для больших текстов, вторая — для коротких
+    поисковых запросов.
+    """
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None,
+        base_url: str,
+        document_model: str,
+        query_model: str,
+    ) -> None:
+        self._client = OpenAI(api_key=api_key, base_url=base_url)
+        self.document_model = document_model
+        self.query_model = query_model
+
+    @staticmethod
+    def name() -> str:
+        """Возвращает имя embedding-функции в формате ChromaDB 1.5+."""
+
+        return "yandex-openai-compatible"
+
+    def get_config(self) -> dict[str, str]:
+        """Возвращает конфигурацию моделей для протокола ChromaDB."""
+
+        return {
+            "provider": "yandex-openai-compatible",
+            "document_model": self.document_model,
+            "query_model": self.query_model,
+        }
+
+    def _embed(self, texts: Sequence[str], model: str) -> list[list[float]]:
+        """Отправляет тексты по одному, сохраняя строковый формат input."""
+
+        vectors: list[list[float]] = []
+        for text in texts:
+            response = self._client.embeddings.create(
+                input=text,
+                model=model,
+                encoding_format="float",
+            )
+            vectors.append(list(response.data[0].embedding))
+        return vectors
+
+    def __call__(self, input: Sequence[str]) -> list[list[float]]:
+        """Создаёт embeddings документов с помощью document-модели."""
+
+        return self._embed(list(input), self.document_model)
+
+    def embed_query(self, input: str | Sequence[str]) -> list[list[float]]:
+        """Создаёт embeddings запросов с помощью query-модели."""
+
+        texts = [input] if isinstance(input, str) else list(input)
+        return self._embed(texts, self.query_model)
 
 
 class _CallableEmbeddingAdapter:
@@ -148,6 +216,9 @@ class ChromaManager:
     ``YANDEX_EMBEDDING_MODEL``
         Модель эмбеддингов, например
         ``emb://<folder_id>/text-search-doc/latest``.
+    ``YANDEX_QUERY_EMBEDDING_MODEL``
+        Модель для коротких поисковых запросов, например
+        ``emb://<folder_id>/text-search-query/latest``.
 
     Args:
         collection_name: Имя коллекции ChromaDB.
@@ -192,6 +263,7 @@ class ChromaManager:
         base_url: str | None = None,
         chat_model: str | None = None,
         embedding_model: str | None = None,
+        query_embedding_model: str | None = None,
         embedding_function: Any | None = None,
         collection_metadata: Mapping[str, Any] | None = None,
         host: str | None = None,
@@ -222,20 +294,25 @@ class ChromaManager:
             "YANDEX_EMBEDDING_MODEL",
             f"emb://{folder_id}/text-search-doc/latest",
         )
+        self.query_embedding_model_name = query_embedding_model or os.getenv(
+            "YANDEX_QUERY_EMBEDDING_MODEL",
+            self.embedding_model_name.replace("text-search-doc", "text-search-query"),
+        )
 
         # Если функция эмбеддингов передана снаружи, не создаём второй клиент.
         # Это позволяет использовать локальную mock-функцию в тестах без сети.
         # В обычном режиме LangChain-объект оборачивается адаптером под
         # низкоуровневый интерфейс ChromaDB (callable с аргументом input).
         if embedding_function is None:
-            langchain_embeddings = OpenAIEmbeddings(
-                model=self.embedding_model_name,
+            self.embedding_function = _YandexOpenAIEmbeddingAdapter(
                 api_key=self.api_key,
                 base_url=self.base_url,
+                document_model=self.embedding_model_name,
+                query_model=self.query_embedding_model_name,
             )
-            self.embedding_function = _LangChainEmbeddingAdapter(langchain_embeddings)
         elif hasattr(embedding_function, "embed_documents"):
-            self.embedding_function = _LangChainEmbeddingAdapter(embedding_function)
+            langchain_embeddings = embedding_function
+            self.embedding_function = _LangChainEmbeddingAdapter(langchain_embeddings)
         elif callable(embedding_function) and not hasattr(embedding_function, "name"):
             self.embedding_function = _CallableEmbeddingAdapter(embedding_function)
         else:
