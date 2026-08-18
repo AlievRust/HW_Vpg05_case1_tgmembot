@@ -127,7 +127,7 @@ class MemoryService:
         search_candidates: Сколько ближайших записей проверять при обновлении
             памяти. Для учебного проекта классифицируется лучшая запись.
         max_distance: Максимальное косинусное расстояние, при котором результат
-            считается кандидатом на сравнение. Большее расстояние означает,
+            считается кандидатом для проверки LLM. Большее расстояние означает,
             что найденный текст недостаточно близок и будет создана новая запись.
     """
 
@@ -140,7 +140,7 @@ class MemoryService:
         *,
         context_size: int = 5,
         search_candidates: int = 5,
-        max_distance: float = 0.35,
+        max_distance: float = 0.8,
         min_confidence: float = 0.7,
     ) -> None:
         if context_size < 1 or search_candidates < 1:
@@ -350,6 +350,15 @@ class MemoryService:
             "normalized_fact": analysis.normalized_fact,
             "claims_json": json.dumps(analysis.claims, ensure_ascii=False),
         }
+        # Дублируем основные поля первого claim в плоских metadata. Это даёт
+        # приложению явную структуру факта: например, residence/city/Berlin.
+        # Исходный текст при этом по-прежнему остаётся единственным document.
+        if analysis.claims:
+            primary_claim = analysis.claims[0]
+            for field in ("fact_type", "attribute", "value"):
+                value = str(primary_claim.get(field, "")).strip()
+                if value:
+                    metadata[field] = value
         if updated:
             metadata["updated_at"] = datetime.now(timezone.utc).isoformat()
         else:
@@ -515,7 +524,11 @@ def build_bot() -> tuple[telebot.TeleBot, MemoryService]:
         manager,
         context_size=_env_int("MEMORY_CONTEXT_SIZE", _env_int("TOP_K", 5)),
         search_candidates=_env_int("MEMORY_SEARCH_CANDIDATES", 5),
-        max_distance=_env_float("MEMORY_MAX_DISTANCE", 0.35),
+        # Порог используется для допуска кандидата к LLM-классификатору.
+        # Значение 0.8 позволяет распознавать противоречия вроде
+        # «Екатеринбург» -> «Берлин», даже если их embedding-расстояние выше
+        # порога строгого совпадения.
+        max_distance=_env_float("MEMORY_MAX_DISTANCE", 0.8),
         min_confidence=_env_float("MEMORY_MIN_CONFIDENCE", 0.7),
     )
     bot = telebot.TeleBot(token, threaded=False)

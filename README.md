@@ -133,7 +133,7 @@ YANDEX_QUERY_EMBEDDING_MODEL=emb://your_folder_id/text-search-query/latest
 | `CHROMA_PERSIST_DIRECTORY` | `data/chroma` | Каталог локального хранилища |
 | `MEMORY_CONTEXT_SIZE` | `5` | Количество записей в контексте ответа |
 | `MEMORY_SEARCH_CANDIDATES` | `5` | Количество кандидатов для проверки памяти |
-| `MEMORY_MAX_DISTANCE` | `0.35` | Максимальное косинусное расстояние для кандидата |
+| `MEMORY_MAX_DISTANCE` | `0.8` | Максимальное расстояние для передачи кандидата в LLM-классификатор |
 | `MEMORY_MIN_CONFIDENCE` | `0.7` | Минимальная уверенность LLM для сохранения факта |
 | `BOT_SYSTEM_PROMPT` | встроенный prompt | Системная инструкция ассистента |
 | `LOG_LEVEL` | `INFO` | Уровень логирования |
@@ -202,7 +202,7 @@ action: skipped user_id=123 record_id=... distance=0.02 reason=...
 action: updated user_id=123 record_id=... distance=0.18 reason=...
 ```
 
-Если бот создаёт слишком много повторов, увеличьте `MEMORY_MAX_DISTANCE`. Если разные факты начинают объединяться, уменьшите это значение.
+Если бот создаёт слишком много повторов, увеличьте `MEMORY_MAX_DISTANCE`, чтобы больше кандидатов проверялось через LLM. Если в классификатор попадает слишком много явно нерелевантных фактов, уменьшите это значение.
 
 ## Управление памятью пользователя
 
