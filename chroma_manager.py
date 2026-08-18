@@ -919,8 +919,22 @@ class ChromaManager:
 
         results = self.search_memory(question, user_id=user_id, n_results=n_results)
         documents = results.get("documents", [[]])
+        metadatas = results.get("metadatas", [[]])
         context_items = documents[0] if documents else []
-        context = "\n\n".join(f"- {document}" for document in context_items if document)
+        metadata_items = metadatas[0] if metadatas else []
+        context_lines: list[str] = []
+        for index, document in enumerate(context_items):
+            if not document:
+                continue
+            metadata = metadata_items[index] if index < len(metadata_items) else {}
+            normalized_fact = metadata.get("normalized_fact") if metadata else None
+            if normalized_fact and normalized_fact != document:
+                context_lines.append(
+                    f"- Исходная фраза: {document}\n  Нормализованный факт: {normalized_fact}"
+                )
+            else:
+                context_lines.append(f"- {document}")
+        context = "\n\n".join(context_lines)
         if not context:
             context = "Память по этому вопросу не найдена."
         prompt = f"Контекст памяти:\n{context}\n\nВопрос пользователя:\n{question}"

@@ -103,6 +103,17 @@ class MemoryDecision:
     reason: str = ""
 
 
+@dataclass(frozen=True)
+class MessageAnalysis:
+    """Результат анализа сообщения до обращения к долговременной памяти."""
+
+    message_type: str
+    memory_worthy: bool
+    normalized_fact: str = ""
+    claims: tuple[dict[str, Any], ...] = ()
+    reason: str = ""
+
+
 class MemoryService:
     """Оркестрирует память пользователя, классификацию и ответы бота.
 
@@ -121,6 +132,7 @@ class MemoryService:
     """
 
     ALLOWED_ACTIONS = {"new", "same", "contradiction"}
+    NON_MEMORY_MESSAGE_TYPES = {"question", "command", "greeting", "other"}
 
     def __init__(
         self,
@@ -129,15 +141,19 @@ class MemoryService:
         context_size: int = 5,
         search_candidates: int = 5,
         max_distance: float = 0.35,
+        min_confidence: float = 0.7,
     ) -> None:
         if context_size < 1 or search_candidates < 1:
             raise ValueError("Размеры контекста и списка кандидатов должны быть больше нуля")
         if max_distance < 0:
             raise ValueError("max_distance не может быть отрицательным")
+        if not 0 <= min_confidence <= 1:
+            raise ValueError("min_confidence должен быть в диапазоне от 0 до 1")
         self.manager = manager
         self.context_size = context_size
         self.search_candidates = search_candidates
         self.max_distance = max_distance
+        self.min_confidence = min_confidence
         self.logger = logging.getLogger("memory")
 
     @staticmethod
@@ -163,6 +179,113 @@ class MemoryService:
             "distance": distances[0][0] if distances and distances[0] else None,
         }
 
+    @staticmethod
+    def _local_prefilter(text: str) -> MessageAnalysis | None:
+        """Отбрасывает только явно безопасные случаи без вызова LLM.
+
+        Вопросы здесь намеренно не отбрасываются автоматически: сообщение
+        может быть смешанным, например «Я живу в Екатеринбурге, а где живёшь
+        ты?». В таком случае LLM должна сохранить утверждение и пропустить
+        вопросительную часть.
+        """
+
+        normalized = re.sub(r"\s+", " ", text.strip()).lower()
+        if normalized.startswith("/"):
+            return MessageAnalysis(
+                message_type="command",
+                memory_worthy=False,
+                reason="telegram_command",
+            )
+
+        greeting_pattern = (
+            r"^(привет|здравствуйте|здравствуй|доброе утро|добрый день|"
+            r"добрый вечер|спасибо|ок|окей|понятно)[!. ]*$"
+        )
+        if re.fullmatch(greeting_pattern, normalized, flags=re.IGNORECASE):
+            return MessageAnalysis(
+                message_type="greeting",
+                memory_worthy=False,
+                reason="obvious_greeting",
+            )
+        return None
+
+    def _analyze_message(self, text: str) -> MessageAnalysis:
+        """Определяет, содержит ли сообщение факты для долговременной памяти.
+
+        LLM возвращает не только общий тип сообщения, но и массив claims. Это
+        позволяет корректно обработать смешанную фразу: факт сохранить, а
+        вопрос из той же фразы пропустить.
+        """
+
+        local_result = self._local_prefilter(text)
+        if local_result is not None:
+            return local_result
+
+        system_prompt = (
+            "Ты анализатор пользовательских сообщений для долговременной памяти. "
+            "Верни только JSON без markdown. Формат: "
+            '{"message_type":"question|statement|mixed|command|greeting|other",'
+            '"memory_worthy":true|false,"normalized_fact":"...",'
+            '"claims":[{"fact_type":"...","attribute":"...",'
+            '"value":"...","normalized_fact":"...","confidence":0.0}],'
+            '"reason":"..."}. '
+            "В claims включай только явные утверждения пользователя о себе, "
+            "его предпочтениях, целях, событиях или важных фактах. "
+            "Вопросы, просьбы, приветствия и команды в claims не включай. "
+            "Для смешанного сообщения извлеки утверждение, но пропусти вопрос. "
+            "Фраза «Ты помнишь, что я живу в Екатеринбурге?» сама по себе "
+            "является вопросом и не должна создавать новую память. "
+            "normalized_fact — краткая нейтральная формулировка на русском языке."
+        )
+        prompt = f"СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ:\n{text}"
+
+        try:
+            raw = self.manager.generate(prompt, system_prompt=system_prompt)
+            match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+            payload = json.loads(match.group(0) if match else raw)
+            message_type = str(payload.get("message_type", "other")).strip().lower()
+            raw_claims = payload.get("claims", [])
+            claims: list[dict[str, Any]] = []
+            if isinstance(raw_claims, list):
+                for claim in raw_claims:
+                    if not isinstance(claim, dict):
+                        continue
+                    normalized_claim = str(claim.get("normalized_fact", "")).strip()
+                    if normalized_claim:
+                        claims.append(
+                            {
+                                "fact_type": str(claim.get("fact_type", "fact")),
+                                "attribute": str(claim.get("attribute", "")),
+                                "value": str(claim.get("value", "")),
+                                "normalized_fact": normalized_claim,
+                                "confidence": float(claim.get("confidence", 0.0)),
+                            }
+                        )
+            normalized_fact = str(payload.get("normalized_fact", "")).strip()
+            if not normalized_fact and claims:
+                normalized_fact = "; ".join(
+                    claim["normalized_fact"] for claim in claims
+                )
+            memory_worthy = bool(payload.get("memory_worthy", bool(claims))) and bool(
+                claims or normalized_fact
+            )
+            return MessageAnalysis(
+                message_type=message_type,
+                memory_worthy=memory_worthy,
+                normalized_fact=normalized_fact,
+                claims=tuple(claims),
+                reason=str(payload.get("reason", "")),
+            )
+        except (json.JSONDecodeError, TypeError, ValueError, AttributeError, KeyError) as error:
+            # При ошибке формата не сохраняем сообщение автоматически: иначе
+            # вопрос может случайно попасть в долговременную память.
+            self.logger.warning("message analyzer fallback: %s", error)
+            return MessageAnalysis(
+                message_type="other",
+                memory_worthy=False,
+                reason="analyzer_fallback",
+            )
+
     def _search_user_memory(self, user_id: str, user_message: str) -> dict[str, Any]:
         """Ищет память только в пространстве конкретного Telegram-пользователя."""
 
@@ -172,7 +295,7 @@ class MemoryService:
             n_results=self.search_candidates,
         )
 
-    def _classify(self, user_message: str, candidate: dict[str, Any]) -> MemoryDecision:
+    def _classify(self, normalized_fact: str, original_message: str, candidate: dict[str, Any]) -> MemoryDecision:
         """Просит YandexGPT классифицировать отношение двух фактов.
 
         Ответ модели запрашивается в JSON, но парсер дополнительно умеет
@@ -190,10 +313,14 @@ class MemoryService:
             "new означает самостоятельную новую информацию."
         )
         prompt = (
-            "СТАРАЯ ЗАПИСЬ ПАМЯТИ:\n"
+            "СТАРЫЙ НОРМАЛИЗОВАННЫЙ ФАКТ:\n"
+            f"{candidate.get('metadata', {}).get('normalized_fact', candidate['document'])}\n\n"
+            "СТАРАЯ ИСХОДНАЯ ФРАЗА:\n"
             f"{candidate['document']}\n\n"
-            "НОВАЯ ФРАЗА ПОЛЬЗОВАТЕЛЯ:\n"
-            f"{user_message}"
+            "НОВЫЙ НОРМАЛИЗОВАННЫЙ ФАКТ:\n"
+            f"{normalized_fact}\n\n"
+            "НОВАЯ ИСХОДНАЯ ФРАЗА ПОЛЬЗОВАТЕЛЯ:\n"
+            f"{original_message}"
         )
         try:
             raw = self.manager.generate(prompt, system_prompt=system_prompt)
@@ -206,6 +333,28 @@ class MemoryService:
         except (json.JSONDecodeError, TypeError, AttributeError, KeyError) as error:
             self.logger.warning("memory classifier fallback: %s", error)
             return MemoryDecision(action="new", reason="classifier_fallback")
+
+    @staticmethod
+    def _memory_metadata(
+        user_id: str,
+        analysis: MessageAnalysis,
+        *,
+        updated: bool = False,
+    ) -> dict[str, str | int | float | bool]:
+        """Формирует плоские metadata, совместимые с ChromaDB."""
+
+        metadata: dict[str, str | int | float | bool] = {
+            "user_id": user_id,
+            "memory_type": "fact",
+            "message_type": analysis.message_type,
+            "normalized_fact": analysis.normalized_fact,
+            "claims_json": json.dumps(analysis.claims, ensure_ascii=False),
+        }
+        if updated:
+            metadata["updated_at"] = datetime.now(timezone.utc).isoformat()
+        else:
+            metadata["created_at"] = datetime.now(timezone.utc).isoformat()
+        return metadata
 
     def remember_message(self, user_id: str | int, user_message: str) -> str:
         """Создаёт, пропускает или обновляет память и возвращает действие.
@@ -220,25 +369,48 @@ class MemoryService:
         if not text:
             raise ValueError("Пустое сообщение нельзя сохранить в память")
 
-        result = self._search_user_memory(normalized_user_id, text)
+        analysis = self._analyze_message(text)
+        if not analysis.memory_worthy:
+            self.logger.info(
+                "action: skipped user_id=%s message_type=%s reason=%s",
+                normalized_user_id,
+                analysis.message_type,
+                analysis.reason,
+            )
+            return "skipped"
+
+        confidences = [
+            float(claim.get("confidence", 0.0)) for claim in analysis.claims
+        ]
+        if not confidences or max(confidences) < self.min_confidence:
+            self.logger.info(
+                "action: skipped user_id=%s message_type=%s reason=low_confidence",
+                normalized_user_id,
+                analysis.message_type,
+            )
+            return "skipped"
+
+        # Для поиска используем нормализованный факт, а в document сохраняем
+        # исходное сообщение целиком. Это помогает сопоставлять разные формы
+        # одного факта и одновременно сохраняет первоисточник.
+        search_text = analysis.normalized_fact or text
+        result = self._search_user_memory(normalized_user_id, search_text)
         candidate = self._best_candidate(result)
         if candidate is None or candidate["distance"] is None or candidate["distance"] > self.max_distance:
             record_id = self.manager.add(
                 text,
-                metadatas={
-                    "user_id": normalized_user_id,
-                    "created_at": self._now(),
-                },
+                metadatas=self._memory_metadata(normalized_user_id, analysis),
             )[0]
             self.logger.info(
-                "action: created user_id=%s record_id=%s distance=%s",
+                "action: created user_id=%s record_id=%s distance=%s fact=%s",
                 normalized_user_id,
                 record_id,
                 candidate["distance"] if candidate else None,
+                analysis.normalized_fact,
             )
             return "created"
 
-        decision = self._classify(text, candidate)
+        decision = self._classify(analysis.normalized_fact, text, candidate)
         if decision.action == "same":
             self.logger.info(
                 "action: skipped user_id=%s record_id=%s distance=%s reason=%s",
@@ -253,37 +425,49 @@ class MemoryService:
             # Передаём новый оригинальный текст как document. Старый bot_response
             # или prompt здесь отсутствуют, потому что они никогда не хранились.
             metadata = dict(candidate.get("metadata") or {})
-            metadata.update(
-                {
-                    "user_id": normalized_user_id,
-                    "updated_at": self._now(),
-                }
-            )
+            metadata.update(self._memory_metadata(normalized_user_id, analysis, updated=True))
             self.manager.update(candidate["id"], document=text, metadata=metadata)
             self.logger.info(
-                "action: updated user_id=%s record_id=%s distance=%s reason=%s",
+                "action: updated user_id=%s record_id=%s distance=%s fact=%s reason=%s",
                 normalized_user_id,
                 candidate["id"],
                 candidate["distance"],
+                analysis.normalized_fact,
                 decision.reason,
             )
             return "updated"
 
         record_id = self.manager.add(
             text,
-            metadatas={
-                "user_id": normalized_user_id,
-                "created_at": self._now(),
-            },
+            metadatas=self._memory_metadata(normalized_user_id, analysis),
         )[0]
         self.logger.info(
-            "action: created user_id=%s record_id=%s distance=%s reason=%s",
+            "action: created user_id=%s record_id=%s distance=%s fact=%s reason=%s",
             normalized_user_id,
             record_id,
             candidate["distance"],
+            analysis.normalized_fact,
             decision.reason,
         )
         return "created"
+
+    def clear_user_memory(self, user_id: str | int) -> int:
+        """Удаляет все записи ChromaDB, принадлежащие одному пользователю."""
+
+        normalized_user_id = str(user_id)
+        records = self.manager.get(
+            where={"user_id": normalized_user_id},
+            include=[],
+        )
+        ids = list(records.get("ids", []))
+        if ids:
+            self.manager.delete(ids=ids)
+        self.logger.info(
+            "action: cleared user_id=%s records=%s",
+            normalized_user_id,
+            len(ids),
+        )
+        return len(ids)
 
     def answer(self, user_id: str | int, user_message: str) -> str:
         """Генерирует ответ на основе контекста из похожих пользовательских фраз."""
@@ -332,8 +516,10 @@ def build_bot() -> tuple[telebot.TeleBot, MemoryService]:
         context_size=_env_int("MEMORY_CONTEXT_SIZE", _env_int("TOP_K", 5)),
         search_candidates=_env_int("MEMORY_SEARCH_CANDIDATES", 5),
         max_distance=_env_float("MEMORY_MAX_DISTANCE", 0.35),
+        min_confidence=_env_float("MEMORY_MIN_CONFIDENCE", 0.7),
     )
     bot = telebot.TeleBot(token, threaded=False)
+    pending_clear: set[str] = set()
 
     @bot.message_handler(commands=["start", "help"])
     def handle_start(message: Any) -> None:
@@ -342,8 +528,33 @@ def build_bot() -> tuple[telebot.TeleBot, MemoryService]:
         bot.reply_to(
             message,
             "Привет! Я помощник с памятью. Напишите сообщение, и я постараюсь "
-            "учесть его в дальнейшем диалоге.",
+            "учесть его в дальнейшем диалоге.\n\n"
+            "Для удаления всей вашей памяти используйте /forget_me.",
         )
+
+    @bot.message_handler(commands=["forget_me", "clear_memory"])
+    def request_memory_clear(message: Any) -> None:
+        """Запрашивает явное подтверждение перед удалением памяти пользователя."""
+
+        user_id = str(message.from_user.id)
+        pending_clear.add(user_id)
+        bot.reply_to(
+            message,
+            "Вся сохранённая память этого пользователя будет удалена. "
+            "Если вы уверены, отправьте /forget_me_confirm.",
+        )
+
+    @bot.message_handler(commands=["forget_me_confirm"])
+    def confirm_memory_clear(message: Any) -> None:
+        """Удаляет память пользователя после отдельного подтверждения."""
+
+        user_id = str(message.from_user.id)
+        if user_id not in pending_clear:
+            bot.reply_to(message, "Сначала отправьте /forget_me.")
+            return
+        pending_clear.discard(user_id)
+        deleted = service.clear_user_memory(user_id)
+        bot.reply_to(message, f"Готово. Удалено записей памяти: {deleted}.")
 
     @bot.message_handler(content_types=["text"])
     def handle_text(message: Any) -> None:
