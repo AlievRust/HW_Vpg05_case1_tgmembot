@@ -1,0 +1,11 @@
+services:
+  telegram-memory-bot:
+    build: .
+    container_name: telegram-memory-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      CHROMA_PERSIST_DIRECTORY: /app/data/chroma
+    volumes:
+      - ./data:/app/data
