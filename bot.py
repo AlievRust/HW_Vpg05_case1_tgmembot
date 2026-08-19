@@ -132,6 +132,7 @@ class MemoryService:
     """
 
     ALLOWED_ACTIONS = {"new", "same", "contradiction"}
+    MEMORY_KINDS = {"fact", "state", "instruction", "task", "note"}
     NON_MEMORY_MESSAGE_TYPES = {"question", "command", "greeting", "other"}
 
     def __init__(
@@ -222,17 +223,24 @@ class MemoryService:
             return local_result
 
         system_prompt = (
-            "Ты анализатор пользовательских сообщений для долговременной памяти. "
+            "Ты анализатор сообщений для универсальной долговременной памяти ассистента. "
             "Верни только JSON без markdown. Формат: "
             '{"message_type":"question|statement|mixed|command|greeting|other",'
             '"memory_worthy":true|false,"normalized_fact":"...",'
-            '"claims":[{"fact_type":"...","attribute":"...",'
-            '"value":"...","normalized_fact":"...","confidence":0.0}],'
+            '"claims":[{"memory_kind":"fact|state|instruction|task|note",'
+            '"subject":"...","predicate":"...","value":"...",'
+            '"normalized_fact":"...","confidence":0.0}],'
             '"reason":"..."}. '
-            "В claims включай только явные утверждения пользователя о себе, "
-            "его предпочтениях, целях, событиях или важных фактах. "
-            "Вопросы, просьбы, приветствия и команды в claims не включай. "
-            "Для смешанного сообщения извлеки утверждение, но пропусти вопрос. "
+            "В claims включай только информацию, которую разумно сохранить для будущего диалога. "
+            "fact — устойчивый факт или справочная информация; state — актуальное, "
+            "потенциально изменяемое состояние пользователя или другой сущности (место проживания, "
+            "цена, статус); instruction — явное указание, как ассистент должен отвечать или вести себя; "
+            "task — намерение, задача или напоминание; note — явная свободная заметка, которую нельзя "
+            "надёжно разложить на другой тип. Для каждого claim заполни subject, predicate и value. "
+            "Например, «билет Екатеринбург—Берлин стоит 30 000 рублей» — state с subject «билет Екатеринбург—Берлин», "
+            "predicate «стоимость», value «30000 RUB»; «веди себя как Гомер Симпсон» — instruction. "
+            "Не сохраняй обычные вопросы, просьбы о разовом действии, приветствия и команды. "
+            "Для смешанного сообщения извлеки утверждение или инструкцию, но пропусти вопрос. "
             "Фраза «Ты помнишь, что я живу в Екатеринбурге?» сама по себе "
             "является вопросом и не должна создавать новую память. "
             "normalized_fact — краткая нейтральная формулировка на русском языке."
@@ -252,10 +260,14 @@ class MemoryService:
                         continue
                     normalized_claim = str(claim.get("normalized_fact", "")).strip()
                     if normalized_claim:
+                        memory_kind = str(claim.get("memory_kind", "fact")).strip().lower()
+                        if memory_kind not in self.MEMORY_KINDS:
+                            memory_kind = "fact"
                         claims.append(
                             {
-                                "fact_type": str(claim.get("fact_type", "fact")),
-                                "attribute": str(claim.get("attribute", "")),
+                                "memory_kind": memory_kind,
+                                "subject": str(claim.get("subject", "")),
+                                "predicate": str(claim.get("predicate", "")),
                                 "value": str(claim.get("value", "")),
                                 "normalized_fact": normalized_claim,
                                 "confidence": float(claim.get("confidence", 0.0)),
@@ -343,27 +355,152 @@ class MemoryService:
     ) -> dict[str, str | int | float | bool]:
         """Формирует плоские metadata, совместимые с ChromaDB."""
 
+        now = datetime.now(timezone.utc).isoformat()
+        primary_claim = analysis.claims[0] if analysis.claims else {}
+        memory_kind = str(primary_claim.get("memory_kind", "fact"))
         metadata: dict[str, str | int | float | bool] = {
             "user_id": user_id,
-            "memory_type": "fact",
+            "memory_type": memory_kind,
             "message_type": analysis.message_type,
             "normalized_fact": analysis.normalized_fact,
             "claims_json": json.dumps(analysis.claims, ensure_ascii=False),
+            "status": "active",
+            "updated_at": now,
         }
-        # Дублируем основные поля первого claim в плоских metadata. Это даёт
-        # приложению явную структуру факта: например, residence/city/Berlin.
+        if not updated:
+            metadata["created_at"] = now
+        # Дублируем основные поля claim в плоских metadata. Это даёт
+        # приложению явную структуру записи: например, state/user/residence/Berlin.
         # Исходный текст при этом по-прежнему остаётся единственным document.
-        if analysis.claims:
-            primary_claim = analysis.claims[0]
-            for field in ("fact_type", "attribute", "value"):
-                value = str(primary_claim.get(field, "")).strip()
-                if value:
-                    metadata[field] = value
-        if updated:
-            metadata["updated_at"] = datetime.now(timezone.utc).isoformat()
-        else:
-            metadata["created_at"] = datetime.now(timezone.utc).isoformat()
+        for field in ("subject", "predicate", "value"):
+            value = str(primary_claim.get(field, "")).strip()
+            if value:
+                metadata[field] = value
+        # Для меняющегося состояния это начало актуальности именно нового значения.
+        if memory_kind == "state":
+            metadata["valid_from"] = now
+            metadata["valid_to"] = ""
         return metadata
+
+    @staticmethod
+    def _analysis_for_claim(
+        analysis: MessageAnalysis, claim: dict[str, Any]
+    ) -> MessageAnalysis:
+        """Возвращает анализ, содержащий ровно одну атомарную запись памяти."""
+
+        return MessageAnalysis(
+            message_type=analysis.message_type,
+            memory_worthy=True,
+            normalized_fact=str(claim["normalized_fact"]),
+            claims=(claim,),
+            reason=analysis.reason,
+        )
+
+    def _search_memory_for_claim(
+        self, user_id: str, claim: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Ищет кандидата в подходящем типе памяти.
+
+        У старых записей ещё стоит ``memory_type=fact``. Поэтому для ``state``
+        поиск включает и ``state``, и старый ``fact``: это сохраняет прежнее
+        обновление места проживания и других пользовательских состояний, но
+        не сравнивает их с инструкциями или задачами.
+        """
+
+        memory_kind = str(claim.get("memory_kind", "fact"))
+        if memory_kind == "state":
+            return self.manager.search(
+                str(claim["normalized_fact"]),
+                n_results=self.search_candidates,
+                where={
+                    "$and": [
+                        {"user_id": user_id},
+                        {"$or": [{"memory_type": "state"}, {"memory_type": "fact"}]},
+                    ]
+                },
+            )
+        return self.manager.search_memory(
+            str(claim["normalized_fact"]),
+            user_id=user_id,
+            memory_type=memory_kind,
+            n_results=self.search_candidates,
+        )
+
+    def _remember_claim(
+        self,
+        user_id: str,
+        source_text: str,
+        analysis: MessageAnalysis,
+        claim: dict[str, Any],
+    ) -> str:
+        """Сохраняет одну атомарную запись и возвращает выполненное действие."""
+
+        claim_analysis = self._analysis_for_claim(analysis, claim)
+        result = self._search_memory_for_claim(user_id, claim)
+        candidate = self._best_candidate(result)
+        if (
+            candidate is None
+            or candidate["distance"] is None
+            or candidate["distance"] > self.max_distance
+        ):
+            record_id = self.manager.add(
+                source_text,
+                metadatas=self._memory_metadata(user_id, claim_analysis),
+            )[0]
+            self.logger.info(
+                "action: created user_id=%s record_id=%s kind=%s distance=%s fact=%s",
+                user_id,
+                record_id,
+                claim["memory_kind"],
+                candidate["distance"] if candidate else None,
+                claim["normalized_fact"],
+            )
+            return "created"
+
+        decision = self._classify(claim_analysis.normalized_fact, source_text, candidate)
+        if decision.action == "same":
+            self.logger.info(
+                "action: skipped user_id=%s record_id=%s kind=%s distance=%s reason=%s",
+                user_id,
+                candidate["id"],
+                claim["memory_kind"],
+                candidate["distance"],
+                decision.reason,
+            )
+            return "skipped"
+
+        # Сохраняем прежнее поведение обновления только для актуальных состояний
+        # и взаимоисключающих инструкций. Остальные противоречивые сведения
+        # остаются самостоятельными заметками с собственной датой.
+        if decision.action == "contradiction" and claim["memory_kind"] in {"state", "instruction"}:
+            metadata = dict(candidate.get("metadata") or {})
+            metadata.update(self._memory_metadata(user_id, claim_analysis, updated=True))
+            self.manager.update(candidate["id"], document=source_text, metadata=metadata)
+            self.logger.info(
+                "action: updated user_id=%s record_id=%s kind=%s distance=%s fact=%s reason=%s",
+                user_id,
+                candidate["id"],
+                claim["memory_kind"],
+                candidate["distance"],
+                claim["normalized_fact"],
+                decision.reason,
+            )
+            return "updated"
+
+        record_id = self.manager.add(
+            source_text,
+            metadatas=self._memory_metadata(user_id, claim_analysis),
+        )[0]
+        self.logger.info(
+            "action: created user_id=%s record_id=%s kind=%s distance=%s fact=%s reason=%s",
+            user_id,
+            record_id,
+            claim["memory_kind"],
+            candidate["distance"],
+            claim["normalized_fact"],
+            decision.reason,
+        )
+        return "created"
 
     def remember_message(self, user_id: str | int, user_message: str) -> str:
         """Создаёт, пропускает или обновляет память и возвращает действие.
@@ -388,10 +525,12 @@ class MemoryService:
             )
             return "skipped"
 
-        confidences = [
-            float(claim.get("confidence", 0.0)) for claim in analysis.claims
+        accepted_claims = [
+            claim
+            for claim in analysis.claims
+            if float(claim.get("confidence", 0.0)) >= self.min_confidence
         ]
-        if not confidences or max(confidences) < self.min_confidence:
+        if not accepted_claims:
             self.logger.info(
                 "action: skipped user_id=%s message_type=%s reason=low_confidence",
                 normalized_user_id,
@@ -399,66 +538,16 @@ class MemoryService:
             )
             return "skipped"
 
-        # Для поиска используем нормализованный факт, а в document сохраняем
-        # исходное сообщение целиком. Это помогает сопоставлять разные формы
-        # одного факта и одновременно сохраняет первоисточник.
-        search_text = analysis.normalized_fact or text
-        result = self._search_user_memory(normalized_user_id, search_text)
-        candidate = self._best_candidate(result)
-        if candidate is None or candidate["distance"] is None or candidate["distance"] > self.max_distance:
-            record_id = self.manager.add(
-                text,
-                metadatas=self._memory_metadata(normalized_user_id, analysis),
-            )[0]
-            self.logger.info(
-                "action: created user_id=%s record_id=%s distance=%s fact=%s",
-                normalized_user_id,
-                record_id,
-                candidate["distance"] if candidate else None,
-                analysis.normalized_fact,
-            )
-            return "created"
-
-        decision = self._classify(analysis.normalized_fact, text, candidate)
-        if decision.action == "same":
-            self.logger.info(
-                "action: skipped user_id=%s record_id=%s distance=%s reason=%s",
-                normalized_user_id,
-                candidate["id"],
-                candidate["distance"],
-                decision.reason,
-            )
-            return "skipped"
-
-        if decision.action == "contradiction":
-            # Передаём новый оригинальный текст как document. Старый bot_response
-            # или prompt здесь отсутствуют, потому что они никогда не хранились.
-            metadata = dict(candidate.get("metadata") or {})
-            metadata.update(self._memory_metadata(normalized_user_id, analysis, updated=True))
-            self.manager.update(candidate["id"], document=text, metadata=metadata)
-            self.logger.info(
-                "action: updated user_id=%s record_id=%s distance=%s fact=%s reason=%s",
-                normalized_user_id,
-                candidate["id"],
-                candidate["distance"],
-                analysis.normalized_fact,
-                decision.reason,
-            )
+        actions = [
+            self._remember_claim(normalized_user_id, text, analysis, claim)
+            for claim in accepted_claims
+        ]
+        # Сохраняем совместимый с прежним кодом один итоговый статус сообщения.
+        if "updated" in actions:
             return "updated"
-
-        record_id = self.manager.add(
-            text,
-            metadatas=self._memory_metadata(normalized_user_id, analysis),
-        )[0]
-        self.logger.info(
-            "action: created user_id=%s record_id=%s distance=%s fact=%s reason=%s",
-            normalized_user_id,
-            record_id,
-            candidate["distance"],
-            analysis.normalized_fact,
-            decision.reason,
-        )
-        return "created"
+        if "created" in actions:
+            return "created"
+        return "skipped"
 
     def clear_user_memory(self, user_id: str | int) -> int:
         """Удаляет все записи ChromaDB, принадлежащие одному пользователю."""
@@ -478,8 +567,32 @@ class MemoryService:
         )
         return len(ids)
 
+    def _active_instructions(self, user_id: str | int) -> list[str]:
+        """Возвращает актуальные инструкции пользователя в порядке свежести."""
+
+        records = self.manager.get(
+            where={
+                "$and": [
+                    {"user_id": str(user_id)},
+                    {"memory_type": "instruction"},
+                ]
+            },
+            include=["documents", "metadatas"],
+        )
+        documents = records.get("documents") or []
+        metadatas = records.get("metadatas") or []
+        instructions: list[tuple[str, str]] = []
+        for index, document in enumerate(documents):
+            metadata = metadatas[index] if index < len(metadatas) else {}
+            if metadata.get("status", "active") != "active":
+                continue
+            instruction = str(metadata.get("normalized_fact") or document).strip()
+            if instruction:
+                instructions.append((str(metadata.get("updated_at", "")), instruction))
+        return [instruction for _, instruction in sorted(instructions, reverse=True)]
+
     def answer(self, user_id: str | int, user_message: str) -> str:
-        """Генерирует ответ на основе контекста из похожих пользовательских фраз."""
+        """Генерирует ответ с релевантной памятью и активными инструкциями."""
 
         system_prompt = os.getenv(
             "BOT_SYSTEM_PROMPT",
@@ -487,6 +600,15 @@ class MemoryService:
             "Используй контекст памяти только если он относится к вопросу пользователя. "
             "Не упоминай техническую реализацию памяти.",
         )
+        instructions = self._active_instructions(user_id)
+        if instructions:
+            instruction_block = "\n".join(f"- {item}" for item in instructions)
+            system_prompt = (
+                f"{system_prompt}\n\n"
+                "Активные пользовательские инструкции для этого диалога "
+                "(выполняй их, если они не конфликтуют с безопасностью и системными правилами):\n"
+                f"{instruction_block}"
+            )
         return self.manager.answer_with_memory(
             user_message,
             user_id=str(user_id),

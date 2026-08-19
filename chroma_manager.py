@@ -928,12 +928,22 @@ class ChromaManager:
                 continue
             metadata = metadata_items[index] if index < len(metadata_items) else {}
             normalized_fact = metadata.get("normalized_fact") if metadata else None
+            memory_type = str(metadata.get("memory_type", "fact")) if metadata else "fact"
+            status = str(metadata.get("status", "active")) if metadata else "active"
+            timestamp = ""
+            if metadata:
+                timestamp = str(metadata.get("updated_at") or metadata.get("created_at") or "")
+            header_parts = [f"тип: {memory_type}", f"статус: {status}"]
+            if timestamp:
+                header_parts.append(f"сведения актуальны на: {timestamp}")
+            header = f"[{' | '.join(header_parts)}]"
             if normalized_fact and normalized_fact != document:
                 context_lines.append(
-                    f"- Исходная фраза: {document}\n  Нормализованный факт: {normalized_fact}"
+                    f"- {header}\n  Исходная фраза: {document}\n"
+                    f"  Нормализованная запись: {normalized_fact}"
                 )
             else:
-                context_lines.append(f"- {document}")
+                context_lines.append(f"- {header}\n  {document}")
         context = "\n\n".join(context_lines)
         if not context:
             context = "Память по этому вопросу не найдена."
