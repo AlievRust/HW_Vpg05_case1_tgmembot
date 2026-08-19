@@ -462,6 +462,19 @@ class ChromaManager:
         self.collection.add(**kwargs)
         return id_list
 
+    def embed_documents(
+        self, texts: str | Sequence[str]
+    ) -> list[list[float]]:
+        """Векторизует тексты документной embedding-моделью.
+
+        Метод полезен, когда исходный документ требуется сохранить без
+        изменений, но для поиска нужен его нормализованный смысловой вариант.
+        Полученные векторы можно передать в ``add()`` или ``update()``.
+        """
+
+        text_list = self._as_list(texts, "texts")
+        return [list(vector) for vector in self.embedding_function(text_list)]
+
     def upsert(
         self,
         documents: str | Sequence[str],

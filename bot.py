@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import re
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -143,8 +144,9 @@ class MemoryService:
         search_candidates: int = 5,
         max_distance: float = 0.8,
         min_confidence: float = 0.7,
+        recent_turns: int = 3,
     ) -> None:
-        if context_size < 1 or search_candidates < 1:
+        if context_size < 1 or search_candidates < 1 or recent_turns < 1:
             raise ValueError("Размеры контекста и списка кандидатов должны быть больше нуля")
         if max_distance < 0:
             raise ValueError("max_distance не может быть отрицательным")
@@ -155,6 +157,10 @@ class MemoryService:
         self.search_candidates = search_candidates
         self.max_distance = max_distance
         self.min_confidence = min_confidence
+        self.recent_turns = recent_turns
+        self.dialogue_history: dict[str, deque[tuple[str, str]]] = defaultdict(
+            lambda: deque(maxlen=recent_turns)
+        )
         self.logger = logging.getLogger("memory")
 
     @staticmethod
@@ -210,7 +216,19 @@ class MemoryService:
             )
         return None
 
-    def _analyze_message(self, text: str) -> MessageAnalysis:
+    def _recent_dialogue(self, user_id: str) -> str:
+        """Форматирует несколько последних реплик для разрешения контекста."""
+
+        turns = self.dialogue_history.get(user_id)
+        if not turns:
+            return "Контекст предыдущих реплик отсутствует."
+        lines: list[str] = []
+        for user_text, assistant_text in turns:
+            lines.append(f"Пользователь: {user_text}")
+            lines.append(f"Ассистент: {assistant_text}")
+        return "\n".join(lines)
+
+    def _analyze_message(self, user_id: str, text: str) -> MessageAnalysis:
         """Определяет, содержит ли сообщение факты для долговременной памяти.
 
         LLM возвращает не только общий тип сообщения, но и массив claims. Это
@@ -241,11 +259,17 @@ class MemoryService:
             "predicate «стоимость», value «30000 RUB»; «веди себя как Гомер Симпсон» — instruction. "
             "Не сохраняй обычные вопросы, просьбы о разовом действии, приветствия и команды. "
             "Для смешанного сообщения извлеки утверждение или инструкцию, но пропусти вопрос. "
+            "Контекст предыдущих реплик используй только для разрешения неполных фраз и местоимений. "
+            "Например, если после разговора о цене пиццы пользователь говорит «у нас 900 рублей», "
+            "сохрани «Пицца в названном городе стоит 900 рублей», а не бюджет пользователя. "
             "Фраза «Ты помнишь, что я живу в Екатеринбурге?» сама по себе "
             "является вопросом и не должна создавать новую память. "
             "normalized_fact — краткая нейтральная формулировка на русском языке."
         )
-        prompt = f"СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ:\n{text}"
+        prompt = (
+            f"КРАТКИЙ КОНТЕКСТ ДИАЛОГА:\n{self._recent_dialogue(user_id)}\n\n"
+            f"ТЕКУЩЕЕ СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ:\n{text}"
+        )
 
         try:
             raw = self.manager.generate(prompt, system_prompt=system_prompt)
@@ -363,6 +387,7 @@ class MemoryService:
             "memory_type": memory_kind,
             "message_type": analysis.message_type,
             "normalized_fact": analysis.normalized_fact,
+            "semantic_text": analysis.normalized_fact,
             "claims_json": json.dumps(analysis.claims, ensure_ascii=False),
             "status": "active",
             "updated_at": now,
@@ -436,6 +461,9 @@ class MemoryService:
         """Сохраняет одну атомарную запись и возвращает выполненное действие."""
 
         claim_analysis = self._analysis_for_claim(analysis, claim)
+        semantic_embedding = self.manager.embed_documents(
+            claim_analysis.normalized_fact
+        )[0]
         result = self._search_memory_for_claim(user_id, claim)
         candidate = self._best_candidate(result)
         if (
@@ -446,6 +474,7 @@ class MemoryService:
             record_id = self.manager.add(
                 source_text,
                 metadatas=self._memory_metadata(user_id, claim_analysis),
+                embeddings=[semantic_embedding],
             )[0]
             self.logger.info(
                 "action: created user_id=%s record_id=%s kind=%s distance=%s fact=%s",
@@ -475,7 +504,12 @@ class MemoryService:
         if decision.action == "contradiction" and claim["memory_kind"] in {"state", "instruction"}:
             metadata = dict(candidate.get("metadata") or {})
             metadata.update(self._memory_metadata(user_id, claim_analysis, updated=True))
-            self.manager.update(candidate["id"], document=source_text, metadata=metadata)
+            self.manager.update(
+                candidate["id"],
+                document=source_text,
+                metadata=metadata,
+                embedding=semantic_embedding,
+            )
             self.logger.info(
                 "action: updated user_id=%s record_id=%s kind=%s distance=%s fact=%s reason=%s",
                 user_id,
@@ -490,6 +524,7 @@ class MemoryService:
         record_id = self.manager.add(
             source_text,
             metadatas=self._memory_metadata(user_id, claim_analysis),
+            embeddings=[semantic_embedding],
         )[0]
         self.logger.info(
             "action: created user_id=%s record_id=%s kind=%s distance=%s fact=%s reason=%s",
@@ -515,7 +550,7 @@ class MemoryService:
         if not text:
             raise ValueError("Пустое сообщение нельзя сохранить в память")
 
-        analysis = self._analyze_message(text)
+        analysis = self._analyze_message(normalized_user_id, text)
         if not analysis.memory_worthy:
             self.logger.info(
                 "action: skipped user_id=%s message_type=%s reason=%s",
@@ -560,6 +595,7 @@ class MemoryService:
         ids = list(records.get("ids", []))
         if ids:
             self.manager.delete(ids=ids)
+        self.dialogue_history.pop(normalized_user_id, None)
         self.logger.info(
             "action: cleared user_id=%s records=%s",
             normalized_user_id,
@@ -609,12 +645,14 @@ class MemoryService:
                 "(выполняй их, если они не конфликтуют с безопасностью и системными правилами):\n"
                 f"{instruction_block}"
             )
-        return self.manager.answer_with_memory(
+        response = self.manager.answer_with_memory(
             user_message,
             user_id=str(user_id),
             n_results=self.context_size,
             system_prompt=system_prompt,
         )
+        self.dialogue_history[str(user_id)].append((user_message, response))
+        return response
 
 
 def build_manager() -> ChromaManager:
@@ -652,6 +690,7 @@ def build_bot() -> tuple[telebot.TeleBot, MemoryService]:
         # порога строгого совпадения.
         max_distance=_env_float("MEMORY_MAX_DISTANCE", 0.8),
         min_confidence=_env_float("MEMORY_MIN_CONFIDENCE", 0.7),
+        recent_turns=_env_int("MEMORY_RECENT_TURNS", 3),
     )
     bot = telebot.TeleBot(token, threaded=False)
     pending_clear: set[str] = set()
